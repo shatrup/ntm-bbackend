@@ -1,0 +1,227 @@
+package service
+
+import (
+	"encoding/json"
+	"ntm-backend/builder"
+	"ntm-backend/domain"
+	"ntm-backend/dto/response"
+	"ntm-backend/repository"
+	"time"
+
+	"github.com/sirupsen/logrus"
+)
+
+//go:generate mockgen -destination=../mocks/service/interfceGraphServiceMock.go -package=service ntm-backend/service ISnmpService
+
+type ISnmpService interface {
+	SnmpGraphDetails(nasId string, startDate string, endDate string) ([]response.InterfaceGraphDetails, error)
+	SnmpUtilizationDetails(nasId string, startDate string, endDate string) ([]response.InterfacesLoadDetails, error)
+	SnmpDeviceDetails(nasId string, startDate string, endDate string) (response.DeviceMemoryLoadDetails, error)
+	SnmpSystemDetails(nasId string, startDate string, endDate string) (response.DeviceDetails, error)
+}
+
+type SnmpService struct {
+	Logger     *logrus.Logger
+	Repository repository.ISnmpESRepository
+	Builder    builder.SnmpBuilder
+}
+
+func (s SnmpService) SnmpGraphDetails(nasId string, startDate string, endDate string) ([]response.InterfaceGraphDetails, error) {
+	intervalTime, second := s.GetAggregationInterval(startDate, endDate)
+	query := map[string]interface{}{
+		"size": 0,
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"filter": []map[string]interface{}{
+					{
+						"range": s.Builder.BuildRange(startDate, endDate),
+					},
+					{
+						"match": s.Builder.BuildMatch(nasId),
+					},
+				},
+			},
+		},
+		"aggs": s.Builder.BuildAggregationsForGraph(intervalTime),
+	}
+	res, err := s.Repository.SnmpSearchQuery(query)
+	if err != nil {
+		s.Logger.Println("Error while connect to the elastic search ", err.Error())
+		return nil, err
+	}
+	defer res.Body.Close()
+	var interfaceResponse domain.SnmpInterfaceGraph
+	if err := json.NewDecoder(res.Body).Decode(&interfaceResponse); err != nil {
+		s.Logger.Println("Decoding error:: ", err.Error())
+		return nil, err
+	}
+	return interfaceResponse.GetSnmpGraphDetails(second)
+}
+
+func (s SnmpService) SnmpUtilizationDetails(nasId string, startDate string, endDate string) ([]response.InterfacesLoadDetails, error) {
+	query := map[string]interface{}{
+		"size": 0,
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"filter": []map[string]interface{}{
+					{
+						"range": s.Builder.BuildRange(startDate, endDate),
+					},
+					{
+						"match": s.Builder.BuildMatch(nasId),
+					},
+				},
+			},
+		},
+		"aggs": map[string]interface{}{
+			"get_nested_interfaces": map[string]interface{}{
+				"nested": map[string]interface{}{
+					"path": "interfaces",
+				},
+				"aggs": s.Builder.BuildInterfaceForUtilization(),
+			},
+		},
+	}
+	res, err := s.Repository.SnmpSearchQuery(query)
+	if err != nil {
+		s.Logger.Println("Error while connect to the elastic search ", err.Error())
+		return nil, err
+	}
+	defer res.Body.Close()
+	var interfaceResponse domain.SnmpInterfaceUtilization
+	if err := json.NewDecoder(res.Body).Decode(&interfaceResponse); err != nil {
+		s.Logger.Println("Decoding error:: ", err.Error())
+		return nil, err
+	}
+	diff := s.GetTime(startDate, endDate)
+	second := int(diff.Seconds())
+	return interfaceResponse.GetSnmpUtilizationDetails(second)
+}
+
+func (s SnmpService) SnmpDeviceDetails(nasId string, startDate string, endDate string) (response.DeviceMemoryLoadDetails, error) {
+	intervalTime, _ := s.GetAggregationInterval(startDate, endDate)
+	query := map[string]interface{}{
+		"size": 0,
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{
+						"range": s.Builder.BuildRange(startDate, endDate),
+					},
+					{
+						"match": s.Builder.BuildMatch(nasId),
+					},
+				},
+			},
+		},
+		"aggs": s.Builder.GetNestedStorage(intervalTime),
+	}
+	res, err := s.Repository.SnmpSearchQuery(query)
+	if err != nil {
+		s.Logger.Println("Error while connect to the elastic search ", err.Error())
+		return response.DeviceMemoryLoadDetails{}, err
+	}
+	var snmpDeviceGraph domain.SnmpDeviceUtilization
+	if err := json.NewDecoder(res.Body).Decode(&snmpDeviceGraph); err != nil {
+		s.Logger.Println("Decoding error:: ", err.Error())
+		return response.DeviceMemoryLoadDetails{}, err
+	}
+	return snmpDeviceGraph.GetSnmpDeviceDetails()
+}
+
+func (s SnmpService) SnmpSystemDetails(nasId string, startDate string, endDate string) (response.DeviceDetails, error) {
+	query := map[string]interface{}{
+		"size": 1,
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"filter": []map[string]interface{}{
+					{
+						"range": s.Builder.BuildRange(startDate, endDate),
+					},
+					{
+						"match": s.Builder.BuildMatch(nasId),
+					},
+				},
+			},
+		},
+		"sort": []map[string]interface{}{
+			{
+				"@timestamp": map[string]interface{}{
+					"order": "desc",
+				},
+			},
+		},
+	}
+	res, err := s.Repository.SnmpSearchQuery(query)
+	if err != nil {
+		s.Logger.Println("Error while connect to the elastic search ", err.Error())
+		return response.DeviceDetails{}, err
+	}
+	defer res.Body.Close()
+	var snmpResponse domain.AutoGenerated
+	if err := json.NewDecoder(res.Body).Decode(&snmpResponse); err != nil {
+		s.Logger.Println("Decoding error:: ", err.Error())
+		return response.DeviceDetails{}, err
+	}
+	return snmpResponse.GetSnmpSystemDetails()
+}
+
+func (s SnmpService) GetTime(startDate string, endDate string) time.Duration {
+	layout := "2006-01-02 15:04:05"
+	sd, err := time.Parse(layout, startDate)
+	if err != nil {
+		s.Logger.Println(err)
+	}
+	ed, err := time.Parse(layout, endDate)
+	if err != nil {
+		s.Logger.Println(err)
+	}
+	diff := ed.Sub(sd)
+	return diff
+}
+
+func (s SnmpService) GetAggregationInterval(startDate string, endDate string) (interval string, seconds float64) {
+	var intervalTime string
+	var second float64
+	diff := s.GetTime(startDate, endDate)
+	hrs := int(diff.Hours())
+	if hrs <= 6 {
+		intervalTime = "1m"
+		second = 60
+	} else if hrs <= 12 && hrs > 6 {
+		intervalTime = "5m"
+		second = 300
+	} else if hrs <= 24 && hrs > 12 {
+		intervalTime = "10m"
+		second = 600
+	} else if (hrs / 24) <= 7 {
+		intervalTime = "30m"
+		second = 1800
+	} else if (hrs/24) <= 14 && (hrs/24) > 7 {
+		intervalTime = "1h"
+		second = 3600
+	} else if (hrs/24) <= 30 && (hrs/24) > 14 {
+		intervalTime = "2h"
+		second = 7200
+	}
+	return intervalTime, second
+}
+
+func (s SnmpService) GetConvertDateTimezone(startDate string, endDate string) (string, string, error) {
+	layout := "2006-01-02 15:04:05"
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+	sd, err := time.ParseInLocation(layout, startDate, loc)
+	if err != nil {
+		s.Logger.Println("err ", err)
+		return "", "", err
+	}
+	ed, err := time.ParseInLocation(layout, endDate, loc)
+	if err != nil {
+		s.Logger.Println("err ", err)
+		return "", "", err
+	}
+	locUtc, _ := time.LoadLocation("UTC")
+	nowSd := sd.In(locUtc).Format(layout)
+	nowEd := ed.In(locUtc).Format(layout)
+	return nowSd, nowEd, nil
+}
